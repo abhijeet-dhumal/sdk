@@ -20,10 +20,10 @@ import string
 import uuid
 from typing import Dict, List, Optional
 
-from kubeflow_trainer_api import models
 from kubeflow.trainer.constants import constants
 from kubeflow.trainer.types import types
 from kubeflow.trainer.utils import utils
+from kubeflow_trainer_api import models
 from kubernetes import client, config, watch
 
 logger = logging.getLogger(__name__)
