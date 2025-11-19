@@ -1,0 +1,28 @@
+# 2. ClusterTrainingRuntime with PVC pre-configured
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: ClusterTrainingRuntime
+metadata:
+  name: torch-cuda-251-with-pvc
+  labels:
+    trainer.kubeflow.org/framework: torch
+spec:
+  mlPolicy:
+    numNodes: 1
+    torch:
+      numProcPerNode: auto
+  template:
+    spec:
+      replicatedJobs:
+        - name: node
+          template:
+            metadata:
+              labels:
+                trainer.kubeflow.org/trainjob-ancestor-step: trainer
+            spec:
+              template:
+                spec:
+                  securityContext:
+                    fsGroup: 1000  # All files on PVC will be group-writable by GID 1000
+                  containers:
+                    - name: node
+                      image: quay.io/modh/training:py311-cuda124-torch251
