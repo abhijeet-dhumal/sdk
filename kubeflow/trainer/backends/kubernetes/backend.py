@@ -34,8 +34,8 @@ import kubeflow.trainer.backends.kubernetes.utils as utils
 from kubeflow.trainer.constants import constants
 from kubeflow.trainer.rhai import (
     RHAITrainer,
-    utils as rhai_utils,
 )
+import kubeflow.trainer.rhai.utils as rhai_utils
 from kubeflow.trainer.types import types
 
 logger = logging.getLogger(__name__)
@@ -218,9 +218,19 @@ class KubernetesBackend(RuntimeBackend):
             trainer_overrides = spec_section.get("trainer", {})
             pod_template_overrides = spec_section.get("podTemplateOverrides")
 
+        # Merge progression tracking annotations if RHAI trainer
         if isinstance(trainer, get_args(RHAITrainer)):
             annotations = rhai_utils.merge_progression_annotations(trainer, annotations)
 
+        # Process output_dir URI for PVC mounting (if trainer has output_dir)
+        if trainer and isinstance(trainer, get_args(RHAITrainer)) and trainer.output_dir:
+            trainer.output_dir, pod_template_overrides = (
+                rhai_utils.apply_output_dir_uri_to_pod_overrides(
+                    trainer.output_dir, pod_template_overrides
+                )
+            )
+
+        # Generate unique name for the TrainJob if not provided
         train_job_name = name or (
             random.choice(string.ascii_lowercase)
             + uuid.uuid4().hex[: constants.JOB_NAME_UUID_LENGTH]

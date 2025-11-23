@@ -1,4 +1,4 @@
-# Copyright 2024 The Kubeflow Authors.
+# Copyright 2025 The Kubeflow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,3 +20,8 @@ ANNOTATION_PROGRESSION_TRACKING = "trainer.opendatahub.io/progression-tracking"
 ANNOTATION_METRICS_PORT = "trainer.opendatahub.io/metrics-port"
 ANNOTATION_METRICS_POLL_INTERVAL = "trainer.opendatahub.io/metrics-poll-interval"
 ANNOTATION_TRAINER_STATUS = "trainer.opendatahub.io/trainerStatus"
+
+# Checkpointing storage constants
+PVC_URI_SCHEME = "pvc://"
+CHECKPOINT_MOUNT_PATH = "/mnt/kubeflow-checkpoints"
+CHECKPOINT_VOLUME_NAME = "checkpoint-storage"

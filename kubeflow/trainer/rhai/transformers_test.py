@@ -1,4 +1,4 @@
-# Copyright 2024 The Kubeflow Authors.
+# Copyright 2025 The Kubeflow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,16 +12,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for TransformersTrainer and instrumentation wrapper generation."""
+"""Tests for TransformersTrainer, instrumentation wrapper, and checkpoint functionality."""
+
+from unittest.mock import patch
 
 import pytest
 
 from kubeflow.trainer.constants import constants
 from kubeflow.trainer.rhai.transformers import (
+    PeriodicCheckpointConfig,
     TransformersTrainer,
+    _build_checkpoint_code,
     get_transformers_instrumentation_wrapper,
 )
-from kubeflow.trainer.test.common import SUCCESS, TestCase
+from kubeflow.trainer.test.common import FAILED, SUCCESS, TestCase
+
+
+# ============================================================================
+# Mock checkpoint code generation to avoid torch dependency
+# ============================================================================
+
+
+def _mock_get_jit_checkpoint_injection_code(
+    output_dir=None, periodic_checkpoint_config=None, enable_jit_checkpoint=False
+):
+    """Mock implementation of get_jit_checkpoint_injection_code that doesn't require torch."""
+    parts = []
+
+    # Build config dict
+    config_lines = ["_KUBEFLOW_CHECKPOINT_CONFIG = {"]
+    config_lines.append(f'    "enable_jit": {enable_jit_checkpoint},')
+    if output_dir:
+        config_lines.append(f'    "output_dir": {repr(output_dir)},')
+    if periodic_checkpoint_config:
+        if "save_strategy" in periodic_checkpoint_config:
+            config_lines.append(
+                f'    "save_strategy": {repr(periodic_checkpoint_config["save_strategy"])},'
+            )
+        if "save_steps" in periodic_checkpoint_config:
+            config_lines.append(f'    "save_steps": {periodic_checkpoint_config["save_steps"]},')
+        if "save_total_limit" in periodic_checkpoint_config:
+            config_lines.append(
+                f'    "save_total_limit": {periodic_checkpoint_config["save_total_limit"]},'
+            )
+    config_lines.append("}")
+    parts.append("\n".join(config_lines))
+
+    # Add CheckpointManager if JIT enabled
+    if enable_jit_checkpoint:
+        parts.append("class CheckpointManager:\n    pass")
+
+    # Add monkey-patch function
+    parts.append("def setup_jit_checkpoint_monkey_patch():\n    pass")
+
+    return "\n\n".join(parts)
+
+
+# ============================================================================
+# Basic TransformersTrainer Tests
+# ============================================================================
 
 
 def test_transformers_trainer_initialization():
@@ -79,6 +128,11 @@ def test_transformers_trainer_with_custom_config():
     assert trainer.metrics_poll_interval_seconds == 60
 
     print("test execution complete")
+
+
+# ============================================================================
+# Validation Tests
+# ============================================================================
 
 
 @pytest.mark.parametrize(
@@ -251,6 +305,11 @@ def test_func_callable_validation(test_case):
         assert type(e) is test_case.expected_error
 
     print("test execution complete")
+
+
+# ============================================================================
+# Instrumentation Wrapper Tests
+# ============================================================================
 
 
 @pytest.mark.parametrize(
@@ -475,6 +534,11 @@ def test_transformers_trainer_configurations(test_case):
     print("test execution complete")
 
 
+# ============================================================================
+# Trainer CRD Generation Tests
+# ============================================================================
+
+
 def test_get_trainer_cr_basic():
     """Test basic Trainer CRD generation from TransformersTrainer."""
     print("Executing test: Basic Trainer CRD generation")
@@ -682,6 +746,11 @@ def test_get_trainer_cr_custom_metrics_port():
     assert "metrics_port=8888" in command_str
 
     print("test execution complete")
+
+
+# ============================================================================
+# Progression Tracking Callback Tests
+# ============================================================================
 
 
 @pytest.mark.parametrize(
@@ -1291,6 +1360,222 @@ def test_honest_progress_reporting(test_case):
     finally:
         if "transformers" in sys.modules:
             del sys.modules["transformers"]
+
+
+# ============================================================================
+# PeriodicCheckpointConfig Validation Tests
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "test_case",
+    [
+        TestCase(
+            name="default periodic config values",
+            expected_status=SUCCESS,
+            config={"save_strategy": "epoch", "save_steps": None, "save_total_limit": 3},
+        ),
+        TestCase(
+            name="valid epoch strategy",
+            expected_status=SUCCESS,
+            config={"save_strategy": "epoch"},
+        ),
+        TestCase(
+            name="valid steps strategy with save_steps",
+            expected_status=SUCCESS,
+            config={"save_strategy": "steps", "save_steps": 100},
+        ),
+        TestCase(
+            name="valid no strategy to disable periodic checkpointing",
+            expected_status=SUCCESS,
+            config={"save_strategy": "no"},
+        ),
+        TestCase(
+            name="invalid strategy raises ValueError",
+            expected_status=FAILED,
+            config={"save_strategy": "invalid"},
+            expected_error=ValueError,
+        ),
+        TestCase(
+            name="steps strategy requires save_steps",
+            expected_status=FAILED,
+            config={"save_strategy": "steps"},
+            expected_error=ValueError,
+        ),
+        TestCase(
+            name="save_total_limit cannot be zero",
+            expected_status=FAILED,
+            config={"save_total_limit": 0},
+            expected_error=ValueError,
+        ),
+        TestCase(
+            name="save_total_limit cannot be negative",
+            expected_status=FAILED,
+            config={"save_total_limit": -1},
+            expected_error=ValueError,
+        ),
+    ],
+)
+def test_periodic_checkpoint_config_validation(test_case):
+    """Test PeriodicCheckpointConfig validation."""
+    print("Executing test:", test_case.name)
+
+    try:
+        config = PeriodicCheckpointConfig(**test_case.config)
+
+        assert test_case.expected_status == SUCCESS
+
+        # Validate expected values
+        if "save_strategy" in test_case.config:
+            assert config.save_strategy == test_case.config["save_strategy"]
+        if "save_steps" in test_case.config:
+            assert config.save_steps == test_case.config["save_steps"]
+        if "save_total_limit" in test_case.config:
+            assert config.save_total_limit == test_case.config["save_total_limit"]
+
+    except Exception as e:
+        assert type(e) is test_case.expected_error
+
+    print("test execution complete")
+
+
+# ============================================================================
+# Checkpoint Injection Tests
+# ============================================================================
+
+
+def _dummy_training_func():
+    """Dummy function for testing."""
+    pass
+
+
+@pytest.mark.parametrize(
+    "test_case",
+    [
+        TestCase(
+            name="no checkpoint code when both disabled",
+            expected_status=SUCCESS,
+            config={
+                "trainer": TransformersTrainer(
+                    func=_dummy_training_func,
+                    enable_jit_checkpoint=False,
+                    periodic_checkpoint_config=None,
+                )
+            },
+            expected_output="",
+        ),
+        TestCase(
+            name="checkpoint code with JIT enabled and default periodic config",
+            expected_status=SUCCESS,
+            config={
+                "trainer": TransformersTrainer(
+                    func=_dummy_training_func,
+                    enable_jit_checkpoint=True,
+                    periodic_checkpoint_config=None,
+                )
+            },
+            expected_output={
+                "contains": [
+                    "_KUBEFLOW_CHECKPOINT_CONFIG",
+                    '"enable_jit": True',
+                    "CheckpointManager",
+                    "setup_jit_checkpoint_monkey_patch",
+                ]
+            },
+        ),
+        TestCase(
+            name="checkpoint code with JIT and custom periodic config",
+            expected_status=SUCCESS,
+            config={
+                "trainer": TransformersTrainer(
+                    func=_dummy_training_func,
+                    enable_jit_checkpoint=True,
+                    output_dir="/mnt/checkpoints",
+                    periodic_checkpoint_config=PeriodicCheckpointConfig(
+                        save_strategy="steps",
+                        save_steps=500,
+                        save_total_limit=5,
+                    ),
+                )
+            },
+            expected_output={
+                "contains": [
+                    '"enable_jit": True',
+                    "'/mnt/checkpoints'",
+                    "\"save_strategy\": 'steps'",
+                    '"save_steps": 500',
+                    '"save_total_limit": 5',
+                ]
+            },
+        ),
+        TestCase(
+            name="checkpoint code with periodic only no JIT",
+            expected_status=SUCCESS,
+            config={
+                "trainer": TransformersTrainer(
+                    func=_dummy_training_func,
+                    enable_jit_checkpoint=False,
+                    periodic_checkpoint_config=PeriodicCheckpointConfig(save_strategy="epoch"),
+                )
+            },
+            expected_output={
+                "contains": ['"enable_jit": False', "setup_jit_checkpoint_monkey_patch"],
+                "not_contains": ["CheckpointManager"],
+            },
+        ),
+        TestCase(
+            name="strategy no propagates to training args",
+            expected_status=SUCCESS,
+            config={
+                "trainer": TransformersTrainer(
+                    func=_dummy_training_func,
+                    enable_jit_checkpoint=False,
+                    periodic_checkpoint_config=PeriodicCheckpointConfig(save_strategy="no"),
+                )
+            },
+            expected_output={
+                "contains": [
+                    "_KUBEFLOW_CHECKPOINT_CONFIG",
+                    "\"save_strategy\": 'no'",
+                ],
+            },
+        ),
+    ],
+)
+@patch(
+    "kubeflow.trainer.rhai.transformers.get_jit_checkpoint_injection_code",
+    _mock_get_jit_checkpoint_injection_code,
+)
+def test_checkpoint_code_injection(test_case):
+    """Test checkpoint code injection logic."""
+    print("Executing test:", test_case.name)
+
+    try:
+        trainer = test_case.config["trainer"]
+        code = _build_checkpoint_code(trainer)
+
+        assert test_case.expected_status == SUCCESS
+
+        # Check expected output
+        if test_case.expected_output == "":
+            assert code == ""
+        elif isinstance(test_case.expected_output, dict):
+            assert code != ""
+
+            # Check contains
+            if "contains" in test_case.expected_output:
+                for substring in test_case.expected_output["contains"]:
+                    assert substring in code, f"Expected '{substring}' in generated code"
+
+            # Check not_contains
+            if "not_contains" in test_case.expected_output:
+                for substring in test_case.expected_output["not_contains"]:
+                    assert substring not in code, f"Did not expect '{substring}' in generated code"
+
+    except Exception as e:
+        assert type(e) is test_case.expected_error
+
+    print("test execution complete")
 
 
 if __name__ == "__main__":
