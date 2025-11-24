@@ -16,16 +16,23 @@
 class CheckpointManager:
     """Manages async just-in-time checkpointing on SIGTERM signal using CUDA streams."""
 
-    import os
-    import signal
-    import threading
-    import time
-
-    import torch
-    from transformers import TrainerCallback
-    from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-
     def __init__(self, trainer):
+        import os
+        import signal
+        import threading
+        import time
+
+        import torch
+        from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+        # Store modules as instance attributes for use in other methods
+        self.os = os
+        self.signal = signal
+        self.threading = threading
+        self.time = time
+        self.torch = torch
+        self.PREFIX_CHECKPOINT_DIR = PREFIX_CHECKPOINT_DIR
+
         self.trainer = trainer
         self.checkpoint_requested = False
         self._original_sigterm_handler = None
@@ -108,8 +115,11 @@ class CheckpointManager:
         """Check if a checkpoint has been requested."""
         return self.checkpoint_requested
 
-    class JITCheckpointCallback(TrainerCallback):
-        """Transformers callback that integrates JIT checkpointing with trainer lifecycle."""
+    class JITCheckpointCallback:
+        """Transformers callback that integrates JIT checkpointing with trainer lifecycle.
+        
+        Note: Inheritance from TrainerCallback is added during code extraction in transformers.py.
+        """
 
         def __init__(self):
             self.jit_manager = None
@@ -151,13 +161,60 @@ class CheckpointManager:
 
 
 def setup_jit_checkpoint_monkey_patch():
-    """Setup monkey patch for Trainer to auto inject JIT checkpoint callback."""
+    """Setup monkey patch for Trainer to auto inject JIT checkpoint callback and auto-resume."""
+    import os
     from transformers import Trainer as _TransformersTrainer
 
     _jit_checkpoint_callback = CheckpointManager.JITCheckpointCallback()
 
-    # Store original __init__ method
+    # Store original __init__ and train methods
     _original_trainer_init = _TransformersTrainer.__init__
+    _original_trainer_train = _TransformersTrainer.train
+
+    def _find_latest_checkpoint(output_dir):
+        """Find the latest checkpoint in the output directory."""
+        if not os.path.exists(output_dir):
+            return None
+        
+        checkpoints = [
+            d for d in os.listdir(output_dir)
+            if d.startswith("checkpoint-") and os.path.isdir(os.path.join(output_dir, d))
+        ]
+        
+        if not checkpoints:
+            return None
+        
+        # Sort by step number (checkpoint-123 -> 123)
+        def get_step(checkpoint_name):
+            try:
+                return int(checkpoint_name.split("-")[1])
+            except (IndexError, ValueError):
+                return 0
+        
+        latest = sorted(checkpoints, key=get_step)[-1]
+        checkpoint_path = os.path.join(output_dir, latest)
+        
+        # Verify checkpoint is complete (no sentinel file)
+        sentinel_file = os.path.join(checkpoint_path, "checkpoint-is-incomplete.txt")
+        if os.path.exists(sentinel_file):
+            print(f"[Kubeflow] Skipping incomplete checkpoint: {checkpoint_path}", flush=True)
+            return None
+        
+        # Check if this is a final checkpoint (trainer_state.json has is_training=False)
+        trainer_state_file = os.path.join(checkpoint_path, "trainer_state.json")
+        if os.path.exists(trainer_state_file):
+            try:
+                import json
+                with open(trainer_state_file, 'r') as f:
+                    trainer_state = json.load(f)
+                    # If training is complete, don't resume from this checkpoint
+                    if not trainer_state.get("is_training", True):
+                        print(f"[Kubeflow] Skipping final checkpoint (training already complete): {checkpoint_path}", flush=True)
+                        return None
+            except Exception as e:
+                print(f"[Kubeflow] Warning: Failed to read trainer_state.json: {e}", flush=True)
+        
+        return checkpoint_path
 
     def _patched_trainer_init(self, *args, **kwargs):
         """Patched Trainer.__init__ that auto-injects JIT checkpoint callback."""
@@ -207,6 +264,82 @@ def setup_jit_checkpoint_monkey_patch():
         if enable_jit:
             _jit_checkpoint_callback._trainer_ref = self
 
-    # Apply monkey-patch
+    def _check_if_training_complete(checkpoint_path):
+        """Check if training is already complete based on trainer_state.json."""
+        import json
+        import os
+        
+        trainer_state_file = os.path.join(checkpoint_path, "trainer_state.json")
+        if not os.path.exists(trainer_state_file):
+            return False
+        
+        try:
+            with open(trainer_state_file, 'r') as f:
+                state = json.load(f)
+            
+            # Check if global_step >= max_steps (training complete)
+            global_step = state.get("global_step", 0)
+            max_steps = state.get("max_steps", 0)
+            
+            if max_steps > 0 and global_step >= max_steps:
+                return True
+            
+            # Also check epoch completion
+            epoch = state.get("epoch", 0)
+            num_train_epochs = state.get("num_train_epochs", 0)
+            
+            if num_train_epochs > 0 and epoch >= num_train_epochs:
+                return True
+            
+            return False
+        except Exception as e:
+            print(f"[Kubeflow] Warning: Could not check training completion: {e}", flush=True)
+            return False
+
+    def _patched_trainer_train(self, resume_from_checkpoint=None, *args, **kwargs):
+        """Patched Trainer.train() that auto-resumes from latest checkpoint."""
+        # If user explicitly provided a checkpoint, use that
+        if resume_from_checkpoint is not None:
+            print(f"[Kubeflow] Using user-provided checkpoint: {resume_from_checkpoint}", flush=True)
+            return _original_trainer_train(self, resume_from_checkpoint=resume_from_checkpoint, *args, **kwargs)
+        
+        # Auto-detect latest checkpoint
+        if hasattr(self.args, "output_dir") and self.args.output_dir:
+            latest_checkpoint = _find_latest_checkpoint(self.args.output_dir)
+            if latest_checkpoint:
+                # Check if training is already complete
+                if _check_if_training_complete(latest_checkpoint):
+                    print(f"[Kubeflow] Training already complete at checkpoint: {latest_checkpoint}", flush=True)
+                    print("[Kubeflow] Skipping training. Delete checkpoint to restart.", flush=True)
+                    # Return a dummy TrainOutput to indicate completion
+                    from transformers.trainer_utils import TrainOutput
+                    return TrainOutput(
+                        global_step=0,
+                        training_loss=0.0,
+                        metrics={"message": "Training already complete, skipped"}
+                    )
+                
+                print(f"[Kubeflow] Auto-resuming from checkpoint: {latest_checkpoint}", flush=True)
+                try:
+                    return _original_trainer_train(self, resume_from_checkpoint=latest_checkpoint, *args, **kwargs)
+                except RuntimeError as e:
+                    error_msg = str(e)
+                    # Check for known checkpoint loading errors
+                    if "don't know how to restore data location" in error_msg or "tagged with cpu:" in error_msg:
+                        print(f"[Kubeflow] Warning: Failed to load checkpoint (PyTorch CPU+DDP issue): {e}", flush=True)
+                        print(f"[Kubeflow] Falling back to training from scratch. Consider deleting: {latest_checkpoint}", flush=True)
+                        # Fall back to training from scratch
+                        return _original_trainer_train(self, resume_from_checkpoint=None, *args, **kwargs)
+                    else:
+                        # Re-raise if it's a different error
+                        raise
+            else:
+                print("[Kubeflow] No checkpoint found, starting from scratch", flush=True)
+        
+        # No checkpoint found, train normally
+        return _original_trainer_train(self, resume_from_checkpoint=None, *args, **kwargs)
+
+    # Apply monkey-patches
     _TransformersTrainer.__init__ = _patched_trainer_init
-    print("[Kubeflow] Trainer auto-instrumentation enabled", flush=True)
+    _TransformersTrainer.train = _patched_trainer_train
+    print("[Kubeflow] Trainer auto-instrumentation enabled (with auto-resume)", flush=True)

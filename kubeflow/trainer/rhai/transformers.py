@@ -634,7 +634,19 @@ def get_jit_checkpoint_injection_code(
     # Only extract JIT checkpoint classes if JIT is enabled
     checkpoint_manager_src = ""
     if enable_jit_checkpoint:
+        # Import TrainerCallback at module level in the extracted code
+        traininercallback_import = "from transformers import TrainerCallback\n\n"
+        
         checkpoint_manager_src = inspect.getsource(jit_checkpoint_code.CheckpointManager)
+        
+        # Add TrainerCallback inheritance to JITCheckpointCallback
+        checkpoint_manager_src = checkpoint_manager_src.replace(
+            "class JITCheckpointCallback:",
+            "class JITCheckpointCallback(TrainerCallback):"
+        )
+        
+        # Add import at the beginning
+        checkpoint_manager_src = traininercallback_import + checkpoint_manager_src
 
     # Build checkpoint config dict
     config_dict = {"enable_jit": enable_jit_checkpoint}
