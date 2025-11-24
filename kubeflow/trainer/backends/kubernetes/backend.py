@@ -223,7 +223,7 @@ class KubernetesBackend(RuntimeBackend):
             annotations = rhai_utils.merge_progression_annotations(trainer, annotations)
 
         # Process output_dir URI for PVC mounting (if trainer has output_dir)
-        if trainer and isinstance(trainer, get_args(RHAITrainer)) and trainer.output_dir:
+        if trainer and isinstance(trainer, get_args(RHAITrainer)) and hasattr(trainer, "output_dir") and trainer.output_dir:
             trainer.output_dir, pod_template_overrides = (
                 rhai_utils.apply_output_dir_uri_to_pod_overrides(
                     trainer.output_dir, pod_template_overrides

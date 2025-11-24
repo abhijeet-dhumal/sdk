@@ -1,0 +1,176 @@
+Investigation for training hub current implementation for progress tracking.
+
+Current Implementation
+
+Where does traininghub write progress json.?
+
+Training Hub's backends (InstructLab for SFT, Mini-Trainer for OSFT) automatically write JSONL metrics files. 
+For SFT, it writes to {ckpt_output_dir}/training_params_and_metrics_global{rank}.jsonl, 
+For OSFT to {ckpt_output_dir}/training_metrics_{rank}.jsonl. 
+
+
+sft() function passes ckpt_output_dir to instructlab training via TrainArgs, https://github.com/kapil27/training_hub/blob/ce5903a96f0cbe435036911952a76cdbef8320c3/src/training_hub/algorithms/sft.py#L198
+
+This then becomes the log_dir for instructlab’s logger: 
+https://github.com/kapil27/kubeflow-sdk/blob/224b284e86d7a38fe02a9d044e597e8ceb52d571/kubeflow/trainer/rhai/traininghub.py#L223
+
+Then instructlab training code construct the file path and during training, metrics are logged.
+https://github.com/instructlab/training/blob/781c36f05b9e3e97f6c019440407354f5ca9d96e/src/instructlab/training/logger.py#L624
+
+
+The first line contains training configuration (including num_epochs), and subsequent lines contain per-step metrics. Updates happen every training step.
+
+Example: for sft:
+
+app-root) sh-5.1$ cat training_params_and_metrics_global0.jsonl 
+{"model_name_or_path": "Qwen/Qwen2.5-0.5B-Instruct", "model_class": "CausalLM", "data_path": "/workspace/processed/data.jsonl", "output_dir": "/workspace/checkpoints", "num_epochs": 2, "current_epoch": 0, "last_step": 0, "effective_batch_size": 2, "learning_rate": 5e-05, "lr_scheduler": "cosine", "num_warmup_steps": 2, "save_samples": 5, "save_samples_ds": null, "save_last": false, "checkpoint_at_epoch": true, "accelerate_full_state_at_epoch": true, "log_level": "INFO", "run_name": null, "logger_type": "async", "seed": 42, "mock_data": false, "mock_len": 2600, "distributed_training_framework": "fsdp", "fsdp_sharding_strategy": "HYBRID_SHARD", "use_dolomite": false, "lora_r": 0, "lora_alpha": 32, "lora_dropout": 0.1, "lora_quant_bits": null, "lora_target_modules": null, "max_batch_len": 1024, "cpu_offload_optimizer": false, "cpu_offload_params_fsdp": false, "cpu_offload_optimizer_pin_memory": false, "cpu_offload_optimizer_ratio": 1.0, "NEFTune_alpha": null, "chat_tmpl_path": null, "disable_flash_attn": true, "keep_last_checkpoint_only": false, "use_liger": false, "timestamp": "2025-11-18T10:48:03.733724"}
+{"num_gpus": 1, "avg_sample_len": 37.6, "effective_batch_size": 2, "max_batch_len_per_gpu": 1024, "packing_max_batch_len": 1024, "num_batches": 10, "avg_samples_per_batch": 2.0, "total_samples": 20, "timestamp": "2025-11-18T10:48:07.331708"}
+.
+.
+
+
+
+
+Differences between OSFT and SFT algorithms?
+
+Both write JSONL metrics but with different schemas and file naming. 
+SFT (InstructLab) provides fields like avg_loss, lr, overall_throughput, samples_seen, 
+OSFT (Mini-Trainer) provides loss, lr, grad_norm, samples_per_second, tokens_per_second. Both backends operate independently without requiring Training Hub modifications.
+
+SFT: https://github.com/instructlab/training/blob/781c36f05b9e3e97f6c019440407354f5ca9d96e/src/instructlab/training/main_ds.py#L169
+
+OSFT: https://github.com/Red-Hat-AI-Innovation-Team/mini_trainer/blob/c232d5cd1e1a917f8e20af3e1d8998287205eb95/src/mini_trainer/train.py#L772
+
+
+HTTP Server Integration
+
+Can web server read Training Hub's progress file?
+
+Yes, tested successfully via both Kubeflow-SDK and TrainJob.yaml. Our HTTP server runs in a background thread within the training pod, reads the rank-0 JSONL file, transforms the schema to match controller expectations, and serves via /metrics endpoint on port 28080. Confirmed working end-to-end with both SDK and YAML approaches.
+
+Check examples : https://github.com/opendatahub-io/kubeflow-sdk/compare/main...kapil27:kubeflow-sdk:training_hub_changes?expand=1
+
+Thread safety for concurrent file writes/reads?
+Yes, thread-safe. The backends(Instructlab and mini-trainer) use append-only(to avoid race-condition) writes to JSONL files, and our HTTP server only reads (never writes). We read the last line for the latest metrics and the first line for configuration(check current implementation). This read-only, append-only pattern avoids lock contention. Tested successfully with no corruption or race conditions.
+
+Tested it multiple times: works well 🙂
+
+Check: 
+
+https://console-openshift-console.apps.oai-kft-ibm.ibm.rh-ods.com/k8s/ns/knema-ftest/trainer.kubeflow.org~v1alpha1~TrainJob
+
+
+File polling vs. watching mechanism?
+We use polling. The HTTP server reads the file on-demand when the controller requests /metrics (every 30 seconds by default). This is simpler than file watching and sufficient for the polling interval. The controller itself polls the HTTP endpoint at configurable intervals.
+
+
+
+
+
+
+
+
+
+
+
+  Controller                HTTP SERVER (In Training Pod)         JSONL File
+   |------ HTTP GET /metrics --------→|                                                   |
+   |     (every 30s)                              |                                                   |
+   |                                                     |---- open() + read() ----------→ |
+   |                                                    |                                                   |
+   |                                                     |←---- file contents -------------    |
+   |                                                     |                                                     |
+   |                                                     | (parse last line)                           |
+   |                                                     | (transform schema)                      |
+   |                                                    |                                                      |
+   |←----- JSON response --------------|                                                       |
+   |  {"progressPercentage": 45, ...}   |                                                       |
+   |                                                     |                                                     |
+   |  (wait 30 seconds)                      |                                                       |
+   |                                                    |                                                     |
+   |------ HTTP GET /metrics --------→ |                                                     |
+   |                                                      |---- open() + read() ----------→  |
+
+Notes: HTTP server does not continuously monitor the file, file is read only when controller makes an HTTP request. Interval can be configured via annotation.
+
+Code ref: https://github.com/kapil27/kubeflow-sdk/blob/224b284e86d7a38fe02a9d044e597e8ceb52d571/kubeflow/trainer/rhai/traininghub.py#L195
+
+Compatibility with current changes.
+
+Any conflicts with file-based approach?
+No conflicts identified. The file-based approach is transparent to Training Hub and doesn't require any changes to the Training Hub library itself. Our HTTP server code is injected by the SDK into the training pod's startup script.(check above code examples)
+
+Existing progress tracking we should align with?
+Yes, we align with the controller's expected schema. Our transformation functions convert Training Hub's JSONL format to the controller's expected fields(not confirmed):
+
+ progressPercentage, currentStep, totalSteps, currentEpoch, totalEpochs, trainMetrics, evalMetrics, estimatedRemainingSeconds.
+
+Algorithm Support
+
+Does this approach work for both OSFT and SFT?
+Yes, fully tested for SFT with InstructLab backend. OSFT support is implemented with schema transformation for Mini-Trainer format, but we have NOT tested OSFT end-to-end (only SFT was tested on the cluster with real training jobs).
+
+Schema differences requiring translation?
+Yes, significant differences exist. We implemented separate transformation functions (_transform_instructlab for SFT, _transform_mini_trainer for OSFT).
+
+
+
+
+
+
+
+Challenges/ Not yet verified:
+
+1. Multi-Node Distributed Training
+	: ensuring only Rank0 is used.
+
+
+# SDK reads rank 0 file
+if self.algorithm == "osft":
+    metrics_file = f"{self.ckpt_output_dir}/training_metrics_0.jsonl"
+else:  # sft
+    rank_0_files = [f for f in files if 'global0.jsonl' in f]
+    metrics_file = rank_0_files[0] if rank_0_files else files[0]
+
+
+2. File System Reliability
+
+What We Encountered:
+
+handleError: failed to resolve symlink ... stale NFS file handle
+
+
+What We Tested:
+Local PVC storage (small scale)
+Recovery after pod deletion/recreation
+What We Haven't Tested:
+Long-running training jobs (> 24 hours) with NFS
+High I/O load scenarios (very frequent metric writes)
+
+
+3. Performance and Resource Usage
+
+Challenge: Scale to Production Workloads
+What We Tested:
+Small training jobs (~2-5 minutes, ~750 steps)
+ 	Small JSONL files (~750 lines, <100 KB)
+What We Haven't Tested:
+Very long training jobs (days/weeks, millions of steps)
+Large JSONL files (>10 MB, >100K lines)
+
+
+4. Production concerns and Security questions:
+ 	Does controller need cluster-admin to read pod logs?
+Can metrics leak sensitive training data?
+
+
+# Controller RBAC needed:
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: trainer-controller
+rules:
+- apiGroups: [""]
+  resources: ["pods/log"]  # ← Can read ALL pod logs cluster-wide!
+  verbs: ["get"]
+
